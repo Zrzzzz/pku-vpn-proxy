@@ -1,0 +1,3 @@
+test.sh
+*.env
+!.env.example
