@@ -1,3 +1,5 @@
 test.sh
 *.env
 !.env.example
+# 个人 Clash 配置（含私人节点凭据），不入库
+config.yaml

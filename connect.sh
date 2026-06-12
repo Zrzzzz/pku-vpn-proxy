@@ -49,6 +49,17 @@ expect {
     send "$phone_number\r"
     exp_continue
   }
+  # 会话数超限：PKU VPN 只允许有限的并发会话。容器异常退出会在服务端
+  # 残留僵尸会话，占满名额后服务端会要求选择一个会话杀掉，提示形如：
+  #   Session limit reached. Choose session to kill:
+  #    - ff73a645 from ...
+  #   Session: [ff73a645|b9c9dccb]:
+  # 这里自动杀掉列表里第一个（最旧的）会话以腾出名额。
+  -re {Session: \[([0-9a-f]+)} {
+    puts "\[INFO\] Session limit reached, killing oldest session: $expect_out(1,string)"
+    send "$expect_out(1,string)\r"
+    exp_continue
+  }
   "Session terminated by server; exiting." {
     puts "\[ERROR\] Session terminated by server; exiting."
     exit 1
