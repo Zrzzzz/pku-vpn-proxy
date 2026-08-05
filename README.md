@@ -2,7 +2,7 @@
 
 把北大 VPN（PKU VPN）变成一个本地 SOCKS5 代理端口，方便配合 Clash / Surge / PAC 做**校内流量分流**——只有访问校内资源（如 `*.pku.edu.cn`）的请求才走 VPN，其余流量直连，不影响日常上网速度。
 
-底层基于 [cernekee/ocproxy](https://github.com/cernekee/ocproxy) + [openconnect](https://www.infradead.org/openconnect/)，在容器内以用户态方式建立 Pulse 隧道并暴露 SOCKS5 端口，**无需 root、无需 TUN 设备、不接管全局网络**。
+底层基于 [openconnect](https://www.infradead.org/openconnect/)（真实 tun 网卡 + 内核 TCP 栈）+ [gost](https://github.com/go-gost/gost) 提供 SOCKS5 入口。容器内只给 PKU 网段装明细路由，**不接管默认路由、不影响宿主机全局网络**。
 
 > Fork & fix of [thezzisu/ocproxy-oci](https://github.com/thezzisu/ocproxy-oci)。
 > **修复点**：北大 VPN 服务端近期修改了多因素认证的提示文案，导致原镜像里 `connect.sh` 的 `expect` 匹配失败、登录时卡死。本仓库改用稳定子串匹配，兼容新旧两种文案。详见 [为什么需要这个 fork](#为什么需要这个-fork)。
@@ -42,8 +42,11 @@ PHONE_NUMBER=手机号第4到7位
 ```sh
 docker run -d --restart=always --name pku-vpn \
   --env-file=pku.env -p 11080:1080 \
+  --device /dev/net/tun --cap-add NET_ADMIN \
   ghcr.io/zrzzzz/pku-vpn-proxy:latest
 ```
+
+> `--device /dev/net/tun --cap-add NET_ADMIN` 是必需的，缺了建不出 tun 网卡，容器会一直重连失败。
 
 > macOS 上 `--env-file` 不会展开 `~`，如果用绝对路径请写 `$HOME/pku.env`，不要写 `~/pku.env`。
 
@@ -56,7 +59,7 @@ docker ps                    # STATUS 显示 (healthy) 即代理探测通过
 curl --socks5-hostname 127.0.0.1:11080 -I https://portal.pku.edu.cn   # 返回 HTTP 200 即可用
 ```
 
-> ⚠️ 用 `--socks5`（本地解析）测试可能返回失败：DNS 若解析出 IPv6 地址，会被发给代理，**而 ocproxy 只支持 IPv4**，于是连不通。改用 `--socks5-hostname`（远端解析）即可。Clash/Surge 走 SOCKS5 对域名规则默认就是远端解析，不受影响。
+> ⚠️ 测试时用 `--socks5-hostname`（远端解析）而不是 `--socks5`（本地解析）：校内私有域名只有校内 DNS 能解析，容器连上后会把解析器切成校内的，交给代理远端解析才对。Clash/Surge 走 SOCKS5 对域名规则默认就是远端解析，不受影响。
 
 成功后，`127.0.0.1:11080` 就是一个走北大内网的 **SOCKS5 代理**。
 
@@ -149,7 +152,9 @@ PKU VPN 的会话约几小时后会**自然超时过期**（日志里是 `Pulse 
 ```sh
 docker build -t pku-vpn-proxy .
 docker run -d --restart=always --name pku-vpn \
-  --env-file=pku.env -p 11080:1080 pku-vpn-proxy
+  --env-file=pku.env -p 11080:1080 \
+  --device /dev/net/tun --cap-add NET_ADMIN \
+  pku-vpn-proxy
 ```
 
 ## 为什么需要这个 fork
@@ -168,15 +173,32 @@ docker run -d --restart=always --name pku-vpn \
 
 字符串不再匹配，`expect` 等不到对应提示就一直挂着，最终超时或被服务端断开（日志里表现为 `Pulse fatal error (reason: 6): agentd error` / `Session terminated by server`）。
 
-本仓库相对原镜像做了三处修复：
+本仓库相对原镜像做了四处修复：
 
 1. **认证提示匹配**：把 `connect.sh` 的 `expect` 匹配从「完整句子」改为「稳定关键子串」（`身份证后6位`、`缺位电话号码`），同时兼容新旧文案，避免服务端再次改文案时重蹈覆辙。
 2. **会话超时自愈**：原 entrypoint 用 `while true; wait` 死循环保活，openconnect 死后容器仍 Up 但代理不通，`--restart=always` 不触发。改为「进程退出即容器退出」+ 看门狗探活，实现自动重连（见上文[自愈机制](#自愈机制)）。
 3. **健康检查**：新增 `HEALTHCHECK` 与 `curl`，可在 `docker ps` 直接看到代理是否真的可用。
+4. **用内核 tun 取代 ocproxy**：见下节。
+
+### 为什么换掉 ocproxy
+
+原方案 `openconnect --script-tun --script "ocproxy -D 1080 -g"` 不建真实网卡，而是用 lwIP 在用户态实现一整套 TCP/IP 栈。实测（2026-08-05，校外访问校内 Proxmox）：
+
+| 指标 | ocproxy（用户态栈） | 内核 tun + gost |
+| --- | --- | --- |
+| 单条连接 | 28 KB/s | 42~53 KB/s |
+| 6 并发总吞吐 | 134 KB/s | 285 KB/s |
+| 校内镜像站单流 | 1.4 KB/s | 61 KB/s |
+
+隧道 RTT 约 45 ms，反推 ocproxy 单流的有效 TCP 窗口只有 **约 1.2 KB（≈1 个 MSS）**——几乎退化成「发一包等一个 ACK」，完全没有流水线。带宽和延迟都不是瓶颈，用户态栈才是。
+
+换成真实 tun 后走内核 TCP 栈，代价是需要 `--device /dev/net/tun --cap-add NET_ADMIN`。路由由 `pku-route.sh` 控制，**只给 PKU 网段装明细路由，默认路由保持不动**——这样既不劫持容器的其它出站流量，也保证宿主机映射进来的 1080 入站连接回包不会被吸进隧道。
+
+> ⚠️ `pku-route.sh` 里有一条 `ip route replace "$VPNGATEWAY/32" via <原网关>` 不能删。`222.29.0.0/16` 覆盖了 pacvpn 自己的地址，少了这条 /32 明细，拨号流量会被路由进还没建好的隧道，死锁在那里无限重连。
 
 > 日志里的 `Failed to open /dev/vhost-net: No such file or directory` 只是容器内缺少虚拟网络加速设备，**不影响连接**，可忽略。
 >
-> ocproxy 是 IPv4-only 的用户态 TCP/IP 栈，**不支持 IPv6**。所以分流规则里不要把 PKU 的 IPv6 段（如 `2001:da8:201::/48`）路由进来，否则那些连接会失败。
+> `ocproxy` 时代的 IPv4-only 限制已随之解除，但 PKU 的 IPv6 段默认仍未加进 `pku-route.sh` 的 `PKU_NETS`；需要的话自行添加并同步分流规则。
 
 ## 致谢
 

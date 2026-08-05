@@ -1,0 +1,16 @@
+# gost 只负责在容器内提供 SOCKS5 入口，出站走哪条路由由 pku-route.sh 装的
+# 明细路由决定（PKU 网段 → tun0，其余 → eth0）。
+#
+# 日志压到 error：gost 默认的 info 级别会为每条连接打两三行 JSON，
+# 把同一个 docker logs 里 openconnect 的拨号输出彻底淹没，排查时看不见真正的错误。
+log:
+  level: error
+  format: text
+
+services:
+  - name: socks5
+    addr: ":1080"
+    handler:
+      type: socks5
+    listener:
+      type: tcp

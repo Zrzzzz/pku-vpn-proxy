@@ -21,8 +21,11 @@ if {$url == ""} {
   exit 1
 }
 
-# 开始连接
-spawn openconnect $oc_args --script-tun --script "ocproxy -D 1080 -g" --user $user $url
+# 开始连接。
+# 走真实 tun 网卡 + 内核 TCP 栈；SOCKS5 由 entrypoint 里的 gost 单独提供。
+# 早先用的是 --script-tun + ocproxy（lwIP 用户态栈），单条连接实测只有 ~28 KB/s
+# （等效窗口约 1 个 MSS），而链路总带宽 ≥230 KB/s —— 瓶颈全在用户态栈上。
+spawn openconnect $oc_args --script /pku-route.sh --user $user $url
 
 # 期待密码提示
 expect "Password:"
