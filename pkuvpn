@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# pkuvpn —— 北大 VPN SOCKS5 代理的一键开关
+#
+#   pkuvpn on        连接（启动容器，没有则按 pku.env 创建）
+#   pkuvpn off       断开（停止容器，保留以便下次秒开）
+#   pkuvpn status    查看容器状态并真实探测代理是否可用
+#   pkuvpn restart   重连
+#   pkuvpn logs      跟随查看日志（Ctrl-C 退出）
+#
+# 这是项目目录里的源文件，~/.local/bin/pkuvpn 是指向它的软链接，改这里即生效。
+
+set -euo pipefail
+
+# ---- 可配置项（也可用同名环境变量覆盖）-------------------------------------
+PKUVPN_DIR="${PKUVPN_DIR:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)}"  # 项目目录（pku.env 所在），默认取脚本真实位置
+CONTAINER="${PKUVPN_CONTAINER:-pku-vpn}"          # 容器名
+IMAGE="${PKUVPN_IMAGE:-pku-vpn-proxy:local}"      # 首次创建用的镜像
+PORT="${PKUVPN_PORT:-11080}"                      # 本地映射端口
+ENV_FILE="${PKUVPN_ENV_FILE:-$PKUVPN_DIR/pku.env}"
+PROBE_URL="${PKUVPN_PROBE_URL:-https://its.pku.edu.cn/}"
+# ---------------------------------------------------------------------------
+
+# 颜色（非 TTY 时自动留空）
+if [[ -t 1 ]]; then
+  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; DIM=$'\e[2m'; N=$'\e[0m'
+else
+  R=''; G=''; Y=''; B=''; DIM=''; N=''
+fi
+ok()   { printf '%s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s!%s %s\n' "$Y" "$N" "$*"; }
+err()  { printf '%s✗%s %s\n' "$R" "$N" "$*" >&2; }
+info() { printf '%s›%s %s\n' "$B" "$N" "$*"; }
+
+need_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    err "未找到 docker，请先安装 Docker。"; exit 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    err "Docker 守护进程没在运行，请先启动 Docker Desktop。"; exit 1
+  fi
+}
+
+# 容器状态：running / stopped / absent
+container_state() {
+  local s
+  s=$(docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null) || { echo absent; return; }
+  case "$s" in
+    running) echo running ;;
+    *)       echo stopped ;;
+  esac
+}
+
+# 真实探测：经本地 SOCKS5 远端解析访问校内站点
+probe() {
+  curl -fsS --max-time 8 --socks5-hostname "127.0.0.1:$PORT" -o /dev/null "$PROBE_URL" 2>/dev/null
+}
+
+cmd_on() {
+  need_docker
+  case "$(container_state)" in
+    running)
+      ok "已经在运行了，端口 127.0.0.1:$PORT" ;;
+    stopped)
+      info "启动已有容器…"
+      docker start "$CONTAINER" >/dev/null
+      ok "已连接，端口 127.0.0.1:$PORT" ;;
+    absent)
+      if [[ ! -f "$ENV_FILE" ]]; then
+        err "找不到配置文件：$ENV_FILE"; exit 1
+      fi
+      info "首次创建容器（镜像 $IMAGE）…"
+      docker run -d --restart=always --name "$CONTAINER" \
+        --env-file="$ENV_FILE" -p "$PORT:1080" "$IMAGE" >/dev/null
+      ok "已连接，端口 127.0.0.1:$PORT" ;;
+  esac
+  printf '%s  隧道建立需几秒，可用 %spkuvpn status%s 查看。%s\n' "$DIM" "$N$DIM" "$N$DIM" "$N"
+}
+
+cmd_off() {
+  need_docker
+  case "$(container_state)" in
+    absent)  warn "容器不存在，本来就没连。" ;;
+    stopped) ok "本来就是断开的。" ;;
+    running)
+      info "停止容器…"
+      docker stop "$CONTAINER" >/dev/null
+      ok "已断开（容器保留，下次 pkuvpn on 秒连）。" ;;
+  esac
+}
+
+cmd_restart() {
+  need_docker
+  if [[ "$(container_state)" == absent ]]; then
+    warn "容器不存在，改为创建并连接。"; cmd_on; return
+  fi
+  info "重连中…"
+  docker restart "$CONTAINER" >/dev/null
+  ok "已重连，端口 127.0.0.1:$PORT"
+}
+
+cmd_status() {
+  need_docker
+  local state; state=$(container_state)
+  case "$state" in
+    absent)
+      err "未连接：容器 $CONTAINER 不存在。"
+      info "用 pkuvpn on 创建并连接。"; exit 1 ;;
+    stopped)
+      warn "已断开：容器存在但已停止。"
+      info "用 pkuvpn on 恢复连接。"; exit 1 ;;
+    running)
+      local health
+      health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER" 2>/dev/null)
+      ok "容器运行中（健康检查：${health}），端口 127.0.0.1:${PORT}"
+      printf '%s  正在通过 SOCKS5 探测 %s …%s\n' "$DIM" "$PROBE_URL" "$N"
+      if probe; then
+        ok "代理可用：校内资源走 VPN 正常。"
+      else
+        warn "代理暂不通（隧道可能还在建立 / 刚重连）。稍等片刻再试，或看 pkuvpn logs。"
+        exit 1
+      fi ;;
+  esac
+}
+
+cmd_logs() {
+  need_docker
+  if [[ "$(container_state)" == absent ]]; then
+    err "容器不存在。"; exit 1
+  fi
+  exec docker logs -f --tail 100 "$CONTAINER"
+}
+
+usage() {
+  cat <<EOF
+${B}pkuvpn${N} —— 北大 VPN SOCKS5 代理开关（127.0.0.1:${PORT}）
+
+用法：
+  ${G}pkuvpn on${N}        连接
+  ${G}pkuvpn off${N}       断开
+  ${G}pkuvpn status${N}    查看状态并探测代理
+  ${G}pkuvpn restart${N}   重连
+  ${G}pkuvpn logs${N}      查看实时日志
+EOF
+}
+
+case "${1:-}" in
+  on|up|start|connect)        cmd_on ;;
+  off|down|stop|disconnect)   cmd_off ;;
+  status|st|ps)               cmd_status ;;
+  restart|reconnect)          cmd_restart ;;
+  logs|log)                   cmd_logs ;;
+  ""|-h|--help|help)          usage ;;
+  *) err "未知命令：$1"; echo; usage; exit 1 ;;
+esac
