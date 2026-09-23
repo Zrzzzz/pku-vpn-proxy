@@ -25,7 +25,12 @@ if {$url == ""} {
 # 走真实 tun 网卡 + 内核 TCP 栈；SOCKS5 由 entrypoint 里的 gost 单独提供。
 # 早先用的是 --script-tun + ocproxy（lwIP 用户态栈），单条连接实测只有 ~28 KB/s
 # （等效窗口约 1 个 MSS），而链路总带宽 ≥230 KB/s —— 瓶颈全在用户态栈上。
-spawn openconnect $oc_args --script /pku-route.sh --user $user $url
+#
+# --no-dtls：不建 ESP（UDP）数据通道，数据全走 TLS。走 ESP 时实测两种必现的假死：
+#   1) TLS 控制通道因空闲在建连后 5/10 分钟被服务端断开（Read error on TLS session），
+#      openconnect 重建 TLS 后 ESP 不再恢复；
+#   2) 约 20 分钟后 ESP detected dead peer，同样不再恢复。
+spawn openconnect $oc_args --no-dtls --script /pku-route.sh --user $user $url
 
 # 期待密码提示
 expect "Password:"
@@ -74,8 +79,15 @@ expect {
   }
 }
 
-# 保持连接
+# 保持连接。openconnect 自己的断线重连从未成功过（重建 TLS 后隧道不再通），
+# 与其等看门狗几分钟后发现，不如一看到断线就退出，交给容器重启重新登录。
 set timeout -1
 expect {
-    timeout { exp_continue }
+  -re {Read error on TLS session|Failed to reconnect} {
+    puts "\[ERROR\] Tunnel dropped: $expect_out(0,string); exiting."
+    exit 1
+  }
+  eof {
+    exit 1
+  }
 }

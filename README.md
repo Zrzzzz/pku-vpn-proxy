@@ -53,7 +53,7 @@ docker run -d --restart=always --name pku-vpn \
 ### 3. 验证
 
 ```sh
-docker logs pku-vpn          # 看到 "ESP session established with server" 即连接成功
+docker logs pku-vpn          # 看到 "with SSL connected and ESP disabled" 即连接成功（数据全走 TLS，见 connect.sh 的 --no-dtls 说明）
 docker ps                    # STATUS 显示 (healthy) 即代理探测通过
 # 验证代理：务必用 --socks5-hostname（让代理远端解析），不要用 --socks5
 curl --socks5-hostname 127.0.0.1:11080 -I https://portal.pku.edu.cn   # 返回 HTTP 200 即可用
